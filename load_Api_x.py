@@ -97,8 +97,7 @@ def init_twitter():
 
 # --- C. Initialize Telegram Client ---
 # 1. Calculate Session Path
-script_dir = os.path.dirname(os.path.abspath(__file__))
-session_path = os.path.join(script_dir, 'meme_bot_session')
+session_path = os.path.join(BASE_DIR, 'meme_bot_session')
 
 # 2. Configure Telegram Proxy
 tg_proxy_config = None
