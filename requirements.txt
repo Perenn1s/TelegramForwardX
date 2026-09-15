@@ -1,4 +1,4 @@
-telethon
-tweepy
-pysocks
-configparser
+telethon>=1.36,<2
+playwright>=1.60,<2
+python-socks[asyncio]>=2.4,<3
+requests[socks]>=2.31,<3

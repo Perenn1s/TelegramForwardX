@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+state/
+forward-*/
+build/
+dist/
+*.spec
+x Api.txt
+
+# Local credentials and account data
+config.ini
+config.local.ini
+.env
+.env.*
+!.env.example
+*.session-*
+*.log
+*.log.*
+*.sqlite3*
+*.db
