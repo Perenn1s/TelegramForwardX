@@ -74,6 +74,10 @@ class DeliveryStore:
 
     def recover(self):
         with self.db:
+            # This old limit check ran before any upload or publish click.
+            self.db.execute("""UPDATE deliveries SET state='pending', last_error=NULL
+                WHERE state='failed' AND tweet_id IS NULL AND last_error=?""",
+                ('Telegram album has more than 4 media items; review it manually to fit one X post',))
             self.db.execute("UPDATE deliveries SET state='pending' WHERE state='processing'")
             self.db.execute("UPDATE deliveries SET album_ready=0 WHERE grouped_id IS NOT NULL AND state='pending'")
             # A crash after create_tweet may have happened after X accepted it.
@@ -131,7 +135,7 @@ class DeliveryStore:
             self.db.execute("""UPDATE deliveries SET album_ready=1
                 WHERE channel_id=? AND grouped_id IS NOT NULL AND state='pending' AND album_due<=?
                 AND NOT EXISTS (SELECT 1 FROM deliveries other WHERE other.channel_id=deliveries.channel_id
-                    AND other.grouped_id=deliveries.grouped_id AND other.state!='pending')""",
+                    AND other.grouped_id=deliveries.grouped_id AND other.state NOT IN ('pending', 'sent'))""",
                 (channel_id, time.time()))
 
     def members(self, job):
@@ -143,6 +147,22 @@ class DeliveryStore:
     def get(self, channel_id, message_id):
         return self.db.execute("SELECT * FROM deliveries WHERE channel_id=? AND message_id=?",
                                (channel_id, message_id)).fetchone()
+
+    def batch(self, job):
+        """Deterministic media batches; success/failure belongs to one X post."""
+        batches, current, media_count = [], [], 0
+        for row in self.members(job):
+            if row['media_kind'] and media_count == 4:
+                batches.append(current)
+                current, media_count = [], 0
+            current.append(row)
+            media_count += bool(row['media_kind'])
+        batches.append(current)
+        return next(batch for batch in batches
+                    if any(row['message_id'] == job['message_id'] for row in batch))
+
+    def batch_job(self, job):
+        return dict(job, member_ids=tuple(row['message_id'] for row in self.batch(job)))
 
     def update(self, job, state, *, error=None, next_attempt=0, tweet_id=None, attempt=False):
         # Freeze the membership before the first await; late arrivals must never
@@ -168,9 +188,12 @@ class DeliveryStore:
         job = self.get(channel_id, message_id)
         if job is None or job["state"] not in ("failed", "uncertain", "pending"):
             raise ValueError("Only pending/failed/uncertain deliveries can be retried")
-        if any(row['state'] not in ('failed', 'uncertain', 'pending') for row in self.members(job)):
+        if any(row['last_error'] == 'Additional album media arrived after delivery started; review the whole album'
+               for row in self.members(job)):
+            raise ValueError('Album has late media; review it before retrying')
+        if any(row['state'] not in ('failed', 'uncertain', 'pending') for row in self.batch(job)):
             raise ValueError('Album includes a sent or active delivery; review it before retrying')
-        self.update(job, "pending")
+        self.update(self.batch_job(job), "pending")
         if job['grouped_id']:
             with self.db:
                 self.db.execute('UPDATE deliveries SET album_ready=0 WHERE channel_id=? AND grouped_id=?',

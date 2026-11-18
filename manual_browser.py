@@ -12,13 +12,89 @@ from urllib.parse import urlsplit
 
 import requests
 
+from local_storage import (check_profile_size, endpoint_file, managed_profile, manual_profile,
+                           migrate_legacy_storage, path_size, profile_in_use, remove_tree)
 
-def manual_profile(base_dir, channel):
-    return Path(base_dir) / "state" / f"x-browser-manual-{channel}"
+# Downloaded models, telemetry, crash dumps and component payloads. Edge
+# refetches or rebuilds every one of them on demand, and none of them holds
+# cookies, tokens or site storage, so removing them cannot sign the profile out
+# of X. "Local State", which holds the cookie encryption key, is never listed.
+COMPONENT_DATA = (
+    "Ad Blocking", "AutoLaunchProtocolsComponent", "Autofill", "BrowserMetrics",
+    "BrowserMetrics-spare.pma",
+    "CertificateRevocation", "Crashpad", "Domain Actions", "EADPData Component",
+    "Edge Data Protection Lists", "Edge Entity Extraction", "Edge Notifications",
+    "Edge Shopping", "Edge Sidebar", "Edge Signal Triggers", "Edge Themes Resources",
+    "Edge Wallet", "Edge3pSerp", "EdgeArbitration", "EdgeLanguageDetectionModel",
+    "EdgeOnDeviceSpeechModel", "FirstPartySetsPreloaded", "GPUPersistentCache",
+    "GrShaderCache", "MEIPreload", "Nurturing", "OnDeviceHeadSuggestModel",
+    "OptimizationHints", "OriginTrials", "PKIMetadata", "ProvenanceData",
+    "ProvenanceDataAllowList", "ProvenanceDataTensors", "RecoveryImproved",
+    "Safe Browsing", "SafetyTips", "ShaderCache", "SmartScreen", "Snapshots",
+    "Speech Recognition", "Subresource Filter", "Trust Protection Lists", "TrustTokenKeyCommitments",
+    "Typosquatting", "Web Notifications Deny List", "Well Known Domains",
+    "WidevineCdm", "WorkspacesNavigationComponent", "ZxcvbnData", "component_crx_cache",
+    "extensions_crx_cache", "hyphen-data",
+)
+
+# Per-profile page caches. Dropping these only makes the next page load slower.
+# They are cleared before every launch, so the closed profile holds no cache.
+# Cookies live in "Network", the signed-in session in "Local Storage", "Session
+# Storage" and "IndexedDB"; none of those names may ever appear here.
+PAGE_CACHES = (
+    "Cache", "Code Cache", "Service Worker", "GPUCache", "DawnGraphiteCache",
+    "DawnWebGPUCache", "GrShaderCache", "ShaderCache", "Shared Dictionary",
+    "AutofillAiModelCache", "EdgeCoupons", "EntityExtraction", "blob_storage",
+    "optimization_guide_hint_cache_store",
+)
 
 
-def endpoint_file(base_dir, channel):
-    return Path(base_dir) / "state" / f"x-browser-endpoint-{channel}.json"
+def prune_profile(profile):
+    """Reclaim all rebuildable browser data, never login or site storage.
+
+    Call this only while the dedicated browser is closed. Component payloads
+    and every page cache go each time, so the closed profile keeps only the
+    X session and a few small bookkeeping files. Only allow-listed names are
+    removed, only inside this profile, and links are never followed.
+    """
+    profile = Path(profile)
+    if not profile.is_dir():
+        return 0
+    if profile_in_use(profile):
+        raise ValueError("The dedicated browser profile is still open. Close that browser window first; "
+                         "nothing was deleted.")
+    freed = sum(remove_tree(profile / name, profile) for name in COMPONENT_DATA)
+    freed += sum(remove_tree(child / name, profile)
+                 for child in profile.iterdir() if child.is_dir() and not child.is_symlink()
+                 for name in PAGE_CACHES)
+    return freed
+
+
+def reclaim_profile_space(profile):
+    freed = prune_profile(profile)
+    if freed:
+        logging.info("Reclaimed %.0f MB of rebuildable browser data from %s. "
+                     "The saved X login, cookies and site storage are untouched.",
+                     freed / 1024 ** 2, Path(profile).name)
+    check_profile_size(profile)
+    return freed
+
+
+def profile_directory(settings):
+    return manual_profile(settings.channel) if settings.mode == "manual" else managed_profile()
+
+
+def prune_browser(base_dir, settings):
+    """--prune-browser: reclaim now instead of at the next browser launch."""
+    if port_in_use(settings.debug_port):
+        raise ValueError("Close the dedicated MemeBot browser window before pruning its profile.")
+    migrate_legacy_storage(base_dir, prune=prune_profile)
+    profile = profile_directory(settings)
+    if not profile.is_dir():
+        raise ValueError("No dedicated browser profile yet; nothing to prune.")
+    logging.info("Pruning %s.", profile.name)
+    reclaim_profile_space(profile)
+    logging.info("Profile now uses %.0f MB; the X session was kept.", path_size(profile) / 1024 ** 2)
 
 
 def validate_endpoint(endpoint, port):
@@ -30,8 +106,8 @@ def validate_endpoint(endpoint, port):
     return endpoint
 
 
-def saved_endpoint(base_dir, settings):
-    path = endpoint_file(base_dir, settings.channel)
+def saved_endpoint(settings):
+    path = endpoint_file(settings.channel)
     if not path.exists():
         raise ValueError("First run MemeBot.exe --open-browser and sign in to X in that window.")
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -59,29 +135,56 @@ def current_endpoint(port):
         return validate_endpoint(response.json()["webSocketDebuggerUrl"], port)
 
 
+def port_in_use(port):
+    with socket.socket() as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+# A size of 0 would mean "browser default", so 1 byte is what turns the HTTP and
+# media caches off. Service Worker and code caches have no such switch; they
+# live only while the window is open and are pruned before the next launch.
+ZERO_CACHE_ARGS = ("--disk-cache-size=1", "--media-cache-size=1")
+
+
+def launch_command(executable, profile, settings):
+    """A normal visible browser that stops hoarding data it never needs here.
+
+    This profile only ever visits x.com, so component downloads, metrics,
+    crash dumps and page caches are pure growth. Signing in is ordinary
+    foreground traffic and is unaffected by these switches, which also match
+    managed mode's defaults.
+    """
+    return [str(executable), f"--user-data-dir={profile.resolve()}",
+            "--remote-debugging-address=127.0.0.1", f"--remote-debugging-port={settings.debug_port}",
+            "--disable-background-networking", "--disable-component-update",
+            "--disable-breakpad", "--disable-crash-reporter", "--disable-sync",
+            "--no-first-run", "--no-default-browser-check",
+            *ZERO_CACHE_ARGS, "--new-window", "https://x.com/home"]
+
+
 def open_browser(base_dir, settings):
     """No Playwright connection or login automation occurs in this command."""
     if settings.mode != "manual":
         raise ValueError("Set Browser.mode=manual before using --open-browser.")
-    marker = endpoint_file(base_dir, settings.channel)
+    marker = endpoint_file(settings.channel)
     port = settings.debug_port
-    with socket.socket() as sock:
-        sock.settimeout(0.5)
-        in_use = sock.connect_ex(("127.0.0.1", port)) == 0
-    if in_use:
+    if port_in_use(port):
         try:
-            if current_endpoint(port) == saved_endpoint(base_dir, settings):
+            if current_endpoint(port) == saved_endpoint(settings):
                 logging.info("MemeBot dedicated browser is already open.")
                 return
         except (ValueError, KeyError, requests.RequestException):
             pass
         raise ValueError("Browser debug port is occupied by another session. Close it or change Browser.debug_port.")
-    profile = manual_profile(base_dir, settings.channel)
+    # The closed debug port shows our browser is not attached; prune_profile
+    # also refuses a profile held by a browser started without that port.
+    migrate_legacy_storage(base_dir, prune=prune_profile)
+    profile = manual_profile(settings.channel)
     profile.mkdir(parents=True, exist_ok=True)
     executable = browser_executable(settings.channel)
-    subprocess.Popen([str(executable), f"--user-data-dir={profile.resolve()}",
-                      "--remote-debugging-address=127.0.0.1", f"--remote-debugging-port={port}",
-                      "--new-window", "https://x.com/home"],
+    reclaim_profile_space(profile)
+    subprocess.Popen(launch_command(executable, profile, settings),
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:

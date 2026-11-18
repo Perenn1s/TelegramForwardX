@@ -1,3 +1,4 @@
+import _local_dir  # noqa: F401  (isolates local data; must stay first)
 """Real local browser + simulated X UI. Opt in with MEMEBOT_BROWSER_TESTS=1.
 
 Every request is intercepted; these tests cannot contact X or publish a post.
@@ -15,7 +16,7 @@ from unittest.mock import patch
 
 from playwright.async_api import async_playwright
 
-from browser_publisher import BrowserPublisher, BrowserSettings, BrowserAttention, composer_text_matches
+from browser_publisher import BrowserPublisher, BrowserSettings, BrowserAttention, PostLimitReached, composer_text_matches
 from manual_browser import browser_executable, current_endpoint, open_browser, saved_endpoint
 
 
@@ -76,7 +77,8 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         self.runtime = await async_playwright().start()
         self.browser = await self.runtime.chromium.launch(
             channel="msedge" if os.name == "nt" else "chromium", headless=True, chromium_sandbox=True)
-        self.page = await self.browser.new_page()
+        # A real context lets the publisher open a replacement tab.
+        self.page = await (await self.browser.new_context()).new_page()
         self.page.set_default_timeout(1000)
         self.html = FIXTURE
         await self.page.route("**/*", lambda route: route.fulfill(status=200, content_type="text/html", body=self.html))
@@ -105,6 +107,25 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(BrowserAttention, "existing draft"):
             await self.publisher.prepare("new message")
         self.assertEqual(await self.page.evaluate("window.clicks"), 0)
+
+    async def test_reply_opens_saved_parent_instead_of_another_post(self):
+        self.publisher.username = 'example_user'
+        self.html = FIXTURE.replace('</body>', '''
+        <article data-testid="tweet"><a href="/example_user/status/900"><time>now</time></a>
+        <button data-testid="reply" onclick="window.parentClicked='900'; document.querySelector('[role=dialog]').style.display='block'">Reply</button></article>
+        <article data-testid="tweet"><a href="/example_user/status/901"><time>now</time></a>
+        <button data-testid="reply" onclick="window.parentClicked='901'">Reply</button></article>
+        <script>document.querySelector('[role=dialog]').style.display='none'</script></body>''')
+        await self.publisher.prepare('', reply_to='900')
+        self.assertEqual(self.page.url, 'https://x.com/example_user/status/900')
+        self.assertEqual(await self.page.evaluate('window.parentClicked'), '900')
+        self.assertEqual(await self.publisher.submit(), '123')
+
+    async def test_missing_reply_target_never_falls_back_to_standalone_post(self):
+        self.publisher.username = 'example_user'
+        with self.assertRaises(BrowserAttention):
+            await self.publisher.prepare('reply', reply_to='900')
+        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
 
     async def test_media_only_post_with_empty_editor_placeholder(self):
         self.html = FIXTURE.replace('data-testid="tweetTextarea_0"></div>',
@@ -320,22 +341,85 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
           const editor=document.querySelector('[contenteditable]');
           editor.oninput=()=>{
             editor.setAttribute('aria-controls','typeaheadDropdownWrapped-1');
-            const cover=document.createElement('div'); cover.id='autocomplete';
+            const cover=document.createElement('div'); cover.id='typeaheadDropdownWrapped-1';
+            cover.setAttribute('role','listbox');
             cover.style='position:fixed;inset:0;z-index:9999';
             document.body.append(cover);
           };
           document.addEventListener('keydown', e=>{if(e.key==='Escape') window.composerClosed=true;});
-          editor.onblur=()=>{
-            document.querySelector('#autocomplete')?.remove();
-            editor.removeAttribute('aria-controls');
-          };
+          editor.onblur=()=>document.querySelector('#typeaheadDropdownWrapped-1')?.remove();
         </script>''')
         await self.publisher.prepare('cat #猫猫')
         self.assertEqual(await self.page.locator('[contenteditable]').inner_text(), 'cat #猫猫')
-        self.assertEqual(await self.page.locator('#autocomplete').count(), 0)
+        self.assertEqual(await self.page.locator('[role="listbox"]').count(), 0)
         self.assertFalse(await self.page.evaluate('!!window.composerClosed'))
         self.assertEqual(await self.page.evaluate('window.clicks'), 0)
         self.assertEqual(await self.publisher.submit(), '123')
+
+    async def test_late_hashtag_autocomplete_is_dismissed_before_post_check(self):
+        # Observed on live X: the list opened only while the video uploaded,
+        # after the post-typing check; the first Tab merely moved focus; and
+        # aria-controls stayed set after the list closed.
+        self.html = FIXTURE.replace('</script>', '''
+          const editor=document.querySelector('[contenteditable]');
+          window.tabs=0;
+          document.querySelector('input[type="file"]').addEventListener('change', ()=>{
+            if(document.querySelector('#typeaheadDropdownWrapped-3')) return;
+            editor.setAttribute('aria-controls','typeaheadDropdownWrapped-3');
+            const cover=document.createElement('div'); cover.id='typeaheadDropdownWrapped-3';
+            cover.setAttribute('role','listbox');
+            cover.style='position:fixed;inset:0;z-index:9999';
+            document.body.append(cover);
+          });
+          document.addEventListener('keydown', e=>{
+            if(e.key==='Tab' && ++window.tabs >= 2) document.querySelector('#typeaheadDropdownWrapped-3')?.remove();
+          });
+        </script>''')
+        path = Path(self.directory.name) / 'clip.mp4'
+        path.write_bytes(b'local fixture')
+        await self.publisher.prepare('喵：找我呢？\n#猫猫', path)
+        self.assertEqual(await self.page.locator('[role="listbox"]').count(), 0)
+        self.assertEqual(await self.page.locator('[contenteditable]').inner_text(), '喵：找我呢？\n#猫猫')
+        self.assertTrue(self.publisher.prepared)
+        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.publisher.submit(), '123')
+
+    async def test_daily_limit_after_click_is_unpublished_and_tab_replaced(self):
+        # Observed on live X: the composer stays open with the post and a banner.
+        self.html = FIXTURE.replace("toast.innerHTML='<a href=\"/example_user/status/123\">View</a>';", '''
+          const banner=document.createElement('div');
+          banner.textContent="You’ve hit the daily post limit. Subscribe to Plus for higher limits.";
+          document.querySelector('[role=dialog]').prepend(banner);''')
+        await self.page.context.route('**/*', lambda route: route.fulfill(
+            status=200, content_type='text/html', body='<html><body>home</body></html>'))
+        old = self.page
+        await self.publisher.prepare('caption')
+        with self.assertRaises(PostLimitReached):
+            await self.publisher.submit()
+        self.assertTrue(old.is_closed())
+        self.assertIsNot(self.publisher.page, old)
+        self.assertFalse(self.publisher.page.is_closed())
+        self.assertFalse(self.publisher.keep_page)
+
+    async def test_short_window_keeps_account_check_working(self):
+        # Observed on live X after the monitor slept: a 1015x468 window moves
+        # the profile link into "More", which looked like an expired login.
+        self.html = FIXTURE.replace('<div role="dialog"', '''<style>
+          @media (max-height: 600px) { [data-testid="AppTabBar_Profile_Link"] { display: none } }
+        </style><div role="dialog"''')
+        await self.page.set_viewport_size({'width': 1015, 'height': 468})
+        await self.publisher.prepare('caption')
+        self.assertEqual(await self.page.evaluate('[innerWidth, innerHeight]'), [1280, 900])
+        self.assertEqual(await self.publisher.submit(), '123')
+
+    async def test_daily_limit_banner_stops_before_typing(self):
+        self.html = FIXTURE.replace('<div role="dialog" aria-modal="true">',
+                                    '<div role="dialog" aria-modal="true"><div>You have hit the daily post limit.</div>')
+        with self.assertRaises(PostLimitReached):
+            await self.publisher.prepare('caption')
+        self.assertEqual(await self.page.locator('[contenteditable]').inner_text(), '')
+        self.assertFalse(self.publisher.prepared)
+        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
 
     async def test_unknown_overlay_blocks_before_prepared_and_never_clicks(self):
         self.html = FIXTURE.replace('</body>', '<div style="position:fixed;inset:0;z-index:9999"></div></body>')
@@ -347,10 +431,16 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
     async def test_save_prompt_returns_to_composer_without_saving_or_discarding_post(self):
         self.html = FIXTURE.replace('</script>', '''
           const editor=document.querySelector('[contenteditable]');
-          editor.oninput=()=>editor.setAttribute('aria-controls','typeaheadDropdownWrapped-1');
+          editor.oninput=()=>{
+            editor.setAttribute('aria-controls','typeaheadDropdownWrapped-1');
+            if(document.querySelector('#typeaheadDropdownWrapped-1')) return;
+            const list=document.createElement('div'); list.id='typeaheadDropdownWrapped-1';
+            list.setAttribute('role','listbox'); list.textContent='#猫猫';
+            document.body.append(list);
+          };
           document.addEventListener('keydown', e=>{
             if(e.key !== 'Tab') return;
-            editor.removeAttribute('aria-controls');
+            document.querySelector('#typeaheadDropdownWrapped-1')?.remove();
             const prompt=document.createElement('div');
             prompt.tabIndex=-1;
             prompt.dataset.testid='confirmationSheetDialog';
@@ -422,7 +512,7 @@ class ManualAttachUITests(unittest.IsolatedAsyncioTestCase):
                 with patch('manual_browser.subprocess', launcher):
                     for cycle in range(2):
                         await asyncio.to_thread(open_browser, directory, settings)
-                        endpoint = saved_endpoint(directory, settings)
+                        endpoint = saved_endpoint(settings)
                         endpoints.append(endpoint)
                         publisher = BrowserPublisher(directory, settings)
                         publisher.playwright = await async_playwright().start()

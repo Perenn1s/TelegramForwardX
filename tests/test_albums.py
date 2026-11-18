@@ -1,3 +1,4 @@
+import _local_dir  # noqa: F401  (isolates local data; must stay first)
 import asyncio
 from pathlib import Path
 import sqlite3
@@ -69,14 +70,89 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         await self.service.process(self.store.next_job(-1001))
         self.assertEqual(self.publisher.submit.await_count, 2)
 
-    async def test_more_than_four_images_stops_whole_album_without_uploading(self):
+    async def test_ten_images_publish_four_then_two_replies_to_main_post(self):
+        self.ingest(*(photo(i, text='caption' if i == 10 else '') for i in range(1, 11)))
+        self.ready()
+        uploaded = []
+        async def prepare(text, paths, **kwargs):
+            uploaded.append((text, [Path(path).read_text() for path in paths], kwargs))
+        self.publisher.prepare.side_effect = prepare
+        self.publisher.submit.side_effect = ['900', '901', '902']
+        while self.store.next_job(-1001):
+            await self.service.process(self.store.next_job(-1001))
+        self.assertEqual(uploaded, [('caption', ['1', '2', '3', '4'], {}),
+                                    ('', ['5', '6', '7', '8'], {'reply_to': '900'}),
+                                    ('', ['9', '10'], {'reply_to': '900'})])
+        self.assertEqual(self.store.counts(), {'sent': 10})
+        self.assertEqual([self.store.get(-1001, i)['tweet_id'] for i in range(1, 11)],
+                         ['900'] * 4 + ['901'] * 4 + ['902'] * 2)
+
+    async def test_restart_after_main_post_only_sends_remaining_photo(self):
         self.ingest(*(photo(i) for i in range(1, 6)))
         self.ready()
-        with self.assertRaisesRegex(NeedsAttention, 'more than 4'):
+        await self.service.process(self.store.next_job(-1001))
+        self.store.recover()
+        self.ready()
+        await self.service.process(self.store.next_job(-1001))
+        self.assertEqual(self.publisher.submit.await_count, 2)
+        self.assertEqual(self.publisher.prepare.call_args.kwargs, {'reply_to': '999'})
+        self.assertEqual(self.store.counts(), {'sent': 5})
+
+    async def test_uncertain_reply_can_retry_without_reposting_main_or_skipping_batch(self):
+        self.ingest(*(photo(i) for i in range(1, 11)))
+        self.ready()
+        await self.service.process(self.store.next_job(-1001))
+        self.publisher.submit.side_effect = BrowserAttention('lost after click')
+        with self.assertRaises(NeedsAttention):
             await self.service.process(self.store.next_job(-1001))
-        self.publisher.prepare.assert_not_awaited()
-        self.publisher.submit.assert_not_awaited()
-        self.assertEqual(self.store.counts(), {'failed': 5})
+        self.assertEqual(self.store.counts(), {'sent': 4, 'uncertain': 4, 'pending': 2})
+        with self.assertRaises(NeedsAttention):
+            await self.service.process(self.store.next_job(-1001))
+        self.store.retry(-1001, 6)
+        self.ready()
+        self.assertEqual(self.store.next_job(-1001)['message_id'], 5)
+        self.publisher.submit.side_effect = None
+        while self.store.next_job(-1001):
+            await self.service.process(self.store.next_job(-1001))
+        self.assertEqual(self.store.counts(), {'sent': 10})
+        self.assertEqual(self.publisher.submit.await_count, 4)
+
+    async def test_old_limit_failure_is_requeued_on_recovery(self):
+        self.ingest(*(photo(i) for i in range(1, 6)))
+        self.store.update(self.store.get(-1001, 1), 'failed', error=
+                          'Telegram album has more than 4 media items; review it manually to fit one X post')
+        self.store.recover()
+        self.ready()
+        self.assertEqual(self.store.counts(), {'pending': 5})
+        self.assertIsNotNone(self.store.next_job(-1001))
+
+    async def test_crash_during_reply_preserves_main_and_blocks_remaining_media(self):
+        self.ingest(*(photo(i) for i in range(1, 11)))
+        self.ready()
+        await self.service.process(self.store.next_job(-1001))
+        self.store.update(self.store.batch_job(self.store.next_job(-1001)), 'sending')
+        self.store.recover()
+        self.ready()
+        self.assertEqual(self.store.counts(), {'sent': 4, 'uncertain': 4, 'pending': 2})
+        self.assertIsNone(self.store.next_job(-1001))
+        # Equivalent durable resolution used by --mark-sent, then restart.
+        self.store.update(self.store.batch_job(self.store.get(-1001, 6)), 'sent', tweet_id='901')
+        self.store.recover()
+        self.ready()
+        await self.service.process(self.store.next_job(-1001))
+        self.assertEqual(self.publisher.prepare.call_args.kwargs, {'reply_to': '999'})
+        self.assertEqual(self.publisher.submit.await_count, 2)
+        self.assertEqual(self.store.counts(), {'sent': 10})
+
+    async def test_reply_download_failure_keeps_main_sent_and_retries_only_reply(self):
+        self.ingest(*(photo(i) for i in range(1, 6)))
+        self.ready()
+        await self.service.process(self.store.next_job(-1001))
+        self.telegram.get_messages.side_effect = OSError('offline')
+        await self.service.process(self.store.next_job(-1001))
+        self.assertEqual(self.store.counts(), {'sent': 4, 'pending': 1})
+        self.assertGreater(self.store.get(-1001, 5)['next_attempt'], 0)
+        self.publisher.submit.assert_awaited_once()
 
     async def test_uncertain_album_recovers_and_retry_by_any_member_requeues_whole_group(self):
         self.ingest(photo(1), photo(2))

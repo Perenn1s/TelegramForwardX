@@ -1,3 +1,4 @@
+import _local_dir  # noqa: F401  (isolates local data; must stay first)
 import asyncio
 import configparser
 import logging

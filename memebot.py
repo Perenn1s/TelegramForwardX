@@ -11,14 +11,18 @@ import run_background
 from browser_publisher import BrowserSettings, BrowserAttention, login_x
 from proxy_settings import resolve_proxy
 from runtime_logging import configure_logging
-from manual_browser import open_browser
+from manual_browser import open_browser, prune_browser
 from delivery_store import data_directory, instance_lock
+from local_storage import clean_stale_media, clean_stale_runtimes, mark_runtime, runtime_lock
 
 
 def main():
+    # Lets later runs recognise (and, once it has exited, delete) this runtime.
+    mark_runtime()
     if len(sys.argv) == 2 and sys.argv[1] == "--background":
         return run_background.main()
-    if len(sys.argv) == 2 and sys.argv[1] in ("--check-config", "--check-proxy", "--login", "--login-x", "--open-browser"):
+    if len(sys.argv) == 2 and sys.argv[1] in ("--check-config", "--check-proxy", "--login",
+                                              "--login-x", "--open-browser", "--prune-browser"):
         configure_logging()
         try:
             if sys.argv[1] == "--check-config":
@@ -35,8 +39,15 @@ def main():
                 logging.info("Configuration OK. X publishing uses a local browser; no X API credentials required. No connections made.")
             elif sys.argv[1] == "--open-browser":
                 config = load_Api_x.read_config()
-                with instance_lock(data_directory(load_Api_x.BASE_DIR) / "forwarder.lock"):
+                with instance_lock(data_directory(load_Api_x.BASE_DIR) / "forwarder.lock"), runtime_lock():
                     open_browser(load_Api_x.BASE_DIR, BrowserSettings.from_config(config))
+            elif sys.argv[1] == "--prune-browser":
+                config = load_Api_x.read_config()
+                # The lock keeps a running forwarder from reopening the browser midway.
+                with instance_lock(data_directory(load_Api_x.BASE_DIR) / "forwarder.lock"), runtime_lock():
+                    clean_stale_media(load_Api_x.BASE_DIR)
+                    clean_stale_runtimes()
+                    prune_browser(load_Api_x.BASE_DIR, BrowserSettings.from_config(config))
             elif sys.argv[1] == "--login-x":
                 async def browser_login():
                     config = load_Api_x.read_config()

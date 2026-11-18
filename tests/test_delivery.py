@@ -1,3 +1,4 @@
+import _local_dir  # noqa: F401  (isolates local data; must stay first)
 import asyncio
 import configparser
 import os
@@ -5,6 +6,7 @@ import sqlite3
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 import subprocess
 import sys
@@ -17,7 +19,7 @@ import requests
 from delivery_store import DeliveryStore, instance_lock
 from forwarder import Forwarder, NeedsAttention, cli, main
 from run_background import supervise
-from browser_publisher import BrowserAttention, BrowserUnavailable
+from browser_publisher import BrowserAttention, BrowserUnavailable, PostLimitReached
 
 
 def message(id=1, text="hello", media=False):
@@ -207,6 +209,26 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         await self.service.process(job)
         self.assertEqual(self.store.get(-1001, 1)['state'], 'sent')
         self.publisher.submit.assert_awaited_once()
+
+    async def test_post_limit_after_click_pauses_queue_without_stopping(self):
+        self.publisher.submit.side_effect = PostLimitReached('daily post limit')
+        first, second = self.add_job(1), self.add_job(2)
+        await self.service.process(first)
+        job = self.store.get(-1001, 1)
+        self.assertEqual(job['state'], 'pending')
+        self.assertGreater(job['next_attempt'], time.time() + 3000)
+        # Message order holds the later delivery behind the paused one.
+        self.assertEqual(self.store.next_job(-1001)['message_id'], 1)
+        self.assertEqual(self.store.get(-1001, 2)['state'], 'pending')
+        self.publisher.close_idle.assert_not_awaited()
+
+    async def test_post_limit_before_typing_pauses_queue_without_clicking(self):
+        self.publisher.prepare.side_effect = PostLimitReached('daily post limit')
+        await self.service.process(self.add_job())
+        job = self.store.get(-1001, 1)
+        self.assertEqual(job['state'], 'pending')
+        self.assertGreater(job['next_attempt'], time.time() + 3000)
+        self.publisher.submit.assert_not_awaited()
 
     async def test_closed_browser_at_preclick_check_can_retry_safely(self):
         self.publisher.submit.side_effect = BrowserUnavailable('closed before click')

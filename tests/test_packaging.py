@@ -1,3 +1,4 @@
+import _local_dir  # noqa: F401  (isolates local data; must stay first)
 import configparser
 from pathlib import Path
 import tempfile

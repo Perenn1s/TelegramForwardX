@@ -1,3 +1,4 @@
+import _local_dir  # noqa: F401  (isolates local data; must stay first)
 import configparser
 import json
 from pathlib import Path
@@ -7,7 +8,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from browser_publisher import BrowserPublisher, BrowserSettings, BrowserUnavailable, BrowserAttention
 from playwright.async_api import Error as PlaywrightError
-from manual_browser import endpoint_file, saved_endpoint, validate_endpoint, open_browser
+from manual_browser import (endpoint_file, launch_command, manual_profile, path_size,
+                            prune_profile, saved_endpoint, validate_endpoint, open_browser)
 
 
 class ManualBrowserTests(unittest.TestCase):
@@ -23,17 +25,16 @@ class ManualBrowserTests(unittest.TestCase):
                 validate_endpoint(value, 9223)
 
     def test_no_blind_attach_to_an_existing_debug_port(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, "--open-browser"):
-                saved_endpoint(directory, BrowserSettings())
+        endpoint_file("msedge").unlink(missing_ok=True)
+        with self.assertRaisesRegex(ValueError, "--open-browser"):
+            saved_endpoint(BrowserSettings())
 
     def test_saved_websocket_identity_is_preserved(self):
-        with tempfile.TemporaryDirectory() as directory:
-            marker = endpoint_file(directory, "msedge")
-            marker.parent.mkdir()
-            url = "ws://127.0.0.1:9223/devtools/browser/pinned-session"
-            marker.write_text(json.dumps({"endpoint": url}))
-            self.assertEqual(saved_endpoint(directory, BrowserSettings()), url)
+        marker = endpoint_file("msedge")
+        self.addCleanup(marker.unlink, missing_ok=True)
+        url = "ws://127.0.0.1:9223/devtools/browser/pinned-session"
+        marker.write_text(json.dumps({"endpoint": url}))
+        self.assertEqual(saved_endpoint(BrowserSettings()), url)
 
     def test_port_collision_does_not_launch_or_attach(self):
         sock = Mock()
@@ -53,6 +54,99 @@ class ManualBrowserTests(unittest.TestCase):
         config.read_dict({"Browser": {"mode": "manual", "headless": "true"}})
         with self.assertRaisesRegex(ValueError, "headless=false"):
             BrowserSettings.from_config(config)
+
+
+class ProfileSizeTests(unittest.TestCase):
+    """The dedicated profile must stay small without a second manual login."""
+
+    def build_profile(self, root, cache_mb=8):
+        profile = Path(root)
+        (profile / "Default" / "Network").mkdir(parents=True)
+        (profile / "Default" / "Local Storage").mkdir()
+        (profile / "Default" / "IndexedDB").mkdir()
+        for login in (profile / "Local State", profile / "Default" / "Preferences",
+                      profile / "Default" / "Network" / "Cookies",
+                      profile / "Default" / "Local Storage" / "leveldb",
+                      profile / "Default" / "IndexedDB" / "x.com.indexeddb"):
+            login.write_bytes(b"session")
+        for name in ("component_crx_cache", "ProvenanceData", "BrowserMetrics", "Crashpad"):
+            (profile / name).mkdir()
+            (profile / name / "payload").write_bytes(b"x" * 1024 * 1024)
+        for name in ("Cache", "Code Cache", "Service Worker"):
+            (profile / "Default" / name).mkdir()
+            (profile / "Default" / name / "data").write_bytes(b"x" * (cache_mb * 1024 * 1024 // 3))
+        return profile
+
+    def assert_login_survives(self, profile):
+        self.assertTrue((profile / "Local State").exists())
+        self.assertTrue((profile / "Default" / "Network" / "Cookies").exists())
+        self.assertTrue((profile / "Default" / "Preferences").exists())
+        self.assertTrue((profile / "Default" / "Local Storage" / "leveldb").exists())
+        self.assertTrue((profile / "Default" / "IndexedDB" / "x.com.indexeddb").exists())
+
+    def test_every_cache_is_cleared_without_losing_the_x_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.build_profile(directory, cache_mb=30)
+            for name in ("WidevineCdm", "Snapshots"):
+                (profile / name).mkdir()
+                (profile / name / "payload").write_bytes(b"x" * 1024)
+            (profile / "BrowserMetrics-spare.pma").write_bytes(b"x" * 1024)
+            freed = prune_profile(profile)
+            self.assertGreater(freed, 30 * 1024 * 1024)
+            self.assertLess(path_size(profile), 1024 * 1024)
+            for name in ("component_crx_cache", "WidevineCdm", "Snapshots", "BrowserMetrics-spare.pma",
+                         "Default/Service Worker", "Default/Cache", "Default/Code Cache"):
+                self.assertFalse((profile / name).exists(), name)
+            self.assert_login_survives(profile)
+
+    def test_small_profile_is_still_left_without_page_caches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.build_profile(directory, cache_mb=1)
+            self.assertGreater(prune_profile(profile), 0)
+            self.assertFalse((profile / "Default" / "Cache").exists())
+            self.assert_login_survives(profile)
+
+    def test_missing_profile_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(prune_profile(Path(directory) / "absent"), 0)
+
+    def test_old_profile_budget_setting_is_accepted_and_ignored(self):
+        config = configparser.ConfigParser()
+        config.read_dict({"Browser": {"max_profile_mb": "300"}})
+        self.assertEqual(BrowserSettings.from_config(config), BrowserSettings())
+
+    def test_launch_keeps_the_saved_profile_and_disables_caches(self):
+        settings = BrowserSettings()
+        profile = Path("C:/bot/state/x-browser-manual-msedge")
+        command = launch_command("msedge.exe", profile, settings)
+        self.assertIn(f"--user-data-dir={profile.resolve()}", command)
+        self.assertIn(f"--remote-debugging-port={settings.debug_port}", command)
+        for flag in ("--disable-background-networking", "--disable-component-update",
+                     "--disable-breakpad", "--disable-sync",
+                     "--disk-cache-size=1", "--media-cache-size=1"):
+            self.assertIn(flag, command)
+        self.assertEqual(command[-1], "https://x.com/home")
+
+    def test_profile_is_pruned_before_launch_and_never_under_a_live_browser(self):
+        order = Mock()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("manual_browser.port_in_use", return_value=False), \
+             patch("manual_browser.browser_executable", return_value="msedge.exe"), \
+             patch("manual_browser.current_endpoint", return_value="ws://127.0.0.1:9223/devtools/browser/new"), \
+             patch("manual_browser.prune_profile", return_value=0) as prune, \
+             patch("manual_browser.subprocess.Popen") as launch:
+            order.attach_mock(prune, "prune")
+            order.attach_mock(launch, "launch")
+            open_browser(directory, BrowserSettings())
+            prune.assert_called_once_with(manual_profile("msedge"))
+            self.assertEqual([call[0] for call in order.mock_calls], ["prune", "launch"])
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("manual_browser.port_in_use", return_value=True), \
+             patch("manual_browser.current_endpoint", side_effect=ValueError("other")), \
+             patch("manual_browser.prune_profile") as prune:
+            with self.assertRaisesRegex(ValueError, "occupied"):
+                open_browser(directory, BrowserSettings())
+            prune.assert_not_called()
 
 
 class DisconnectTests(unittest.IsolatedAsyncioTestCase):
@@ -78,7 +172,7 @@ class DisconnectTests(unittest.IsolatedAsyncioTestCase):
     async def test_closure_during_navigation_is_known_preclick_failure(self):
         p = BrowserPublisher('.', BrowserSettings())
         p.ensure_ready = AsyncMock()
-        p.page = Mock(is_closed=Mock(return_value=True),
+        p.page = Mock(is_closed=Mock(return_value=True), evaluate=AsyncMock(return_value=[1920, 1080]),
                       add_locator_handler=AsyncMock(side_effect=PlaywrightError('closed')),
                       remove_locator_handler=AsyncMock())
         with self.assertRaises(BrowserUnavailable):
@@ -88,7 +182,7 @@ class DisconnectTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_opens_saved_profile_before_attaching(self):
         p = BrowserPublisher('.', BrowserSettings())
         page = Mock(url='https://x.com/home', is_closed=Mock(return_value=False),
-                    goto=AsyncMock(), set_default_timeout=Mock(),
+                    goto=AsyncMock(), set_default_timeout=Mock(), evaluate=AsyncMock(return_value=[1920, 1080]),
                     locator=Mock(return_value=Mock(wait_for=AsyncMock())))
         browser = Mock(contexts=[Mock(pages=[page], new_page=AsyncMock())])
         driver = Mock(chromium=Mock(connect_over_cdp=AsyncMock(return_value=browser)))
@@ -114,6 +208,8 @@ class DisconnectTests(unittest.IsolatedAsyncioTestCase):
                 await p.start()
             context.new_page.assert_not_awaited()
             page.goto.assert_awaited_once_with('https://x.com/home', wait_until='domcontentloaded')
+            args = driver.chromium.launch_persistent_context.await_args.kwargs['args']
+            self.assertEqual(args, ['--disk-cache-size=1', '--media-cache-size=1', '--no-proxy-server'])
 
     async def test_select_page_preserves_login_and_unrelated_tabs(self):
         p = BrowserPublisher('.', BrowserSettings())

@@ -18,7 +18,7 @@ echo Starting MemeBot. Logs: %~dp0state
 set "BOT_EXIT=%ERRORLEVEL%"
 if not "%BOT_EXIT%"=="0" (
     echo MemeBot stopped with code %BOT_EXIT%. Check state\forwarder.log.
-    echo Complete X login in the dedicated browser, then restart MemeBot.exe. Use --login-x for login only.
+    echo Follow the specific error in the log. Use --login-x only for X login problems.
     pause
 )
 exit /b %BOT_EXIT%

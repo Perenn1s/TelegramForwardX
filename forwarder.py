@@ -16,12 +16,17 @@ from telethon import events, utils
 from telethon.errors import FloodWaitError, ServerError, RpcCallFailError
 
 from delivery_store import AlreadyRunning, DeliveryStore, data_directory, instance_lock
+from local_storage import (MEDIA_PREFIX, clean_stale_media, clean_stale_runtimes, media_temp_dir,
+                           runtime_lock, storage_report)
 from load_Api_x import BASE_DIR, create_telegram, read_config
-from browser_publisher import BrowserPublisher, BrowserSettings, BrowserAttention, BrowserUnavailable
+from browser_publisher import (BrowserPublisher, BrowserSettings, BrowserAttention, BrowserUnavailable,
+                               PostLimitReached)
 from proxy_settings import resolve_proxy
 from runtime_logging import configure_logging
 
 log = logging.getLogger(__name__)
+# X does not say when its daily limit resets; the queue waits in order.
+POST_LIMIT_RETRY_SECONDS = 3600
 
 
 class NeedsAttention(RuntimeError):
@@ -93,6 +98,13 @@ class Forwarder:
 
     def record_failure(self, job, error, *, publishing=False):
         key = f"{job['channel_id']}:{job['message_id']}"
+        if isinstance(error, PostLimitReached):
+            # Confirmed unpublished, even after the click. The queue is served
+            # in message order, so this deadline pauses all later deliveries.
+            self.store.update(job, 'pending', error=error, next_attempt=time.time() + POST_LIMIT_RETRY_SECONDS)
+            log.warning('Delivery %s not published: X daily post limit reached. Queue paused; retrying in %s minutes.',
+                        key, POST_LIMIT_RETRY_SECONDS // 60)
+            return
         if publishing:
             # Any failure after entering submit may have followed a successful
             # click, including a lost browser connection or an unrecognized UI.
@@ -136,16 +148,23 @@ class Forwarder:
                  job["channel_id"], job["message_id"], tweet_id)
 
     async def process(self, job):
-        members = self.store.members(job)
-        if any(row['state'] != 'pending' for row in members):
+        album = self.store.members(job)
+        members = self.store.batch(job)
+        if (any(row['state'] not in ('pending', 'sent') for row in album)
+                or any(row['state'] != 'pending' for row in members)):
             raise NeedsAttention('Album contains previously sent or unresolved media; review before retrying')
+        reply_to = None
+        if members[0]['message_id'] != album[0]['message_id']:
+            preceding = [row for row in album if row['message_id'] < members[0]['message_id']]
+            if any(row['state'] != 'sent' or not row['tweet_id'] for row in preceding):
+                raise NeedsAttention('Earlier album batches must be confirmed before sending replies')
+            reply_to = album[0]['tweet_id']
         job = dict(job, member_ids=tuple(row['message_id'] for row in members))
         self.store.update(job, "processing", attempt=True)
         try:
-            with tempfile.TemporaryDirectory(prefix="forward-", dir=BASE_DIR) as directory:
+            # Media stays on this computer, never in the (maybe cloud-synced) program folder.
+            with tempfile.TemporaryDirectory(prefix=MEDIA_PREFIX, dir=media_temp_dir()) as directory:
                 media = [row for row in members if row['media_kind']]
-                if len(media) > 4:
-                    raise BrowserAttention('Telegram album has more than 4 media items; review it manually to fit one X post')
                 paths = []
                 for member in media:
                     message = await self.telegram.get_messages(self.entity, ids=member['message_id'])
@@ -158,11 +177,12 @@ class Forwarder:
                     if not path:
                         raise ValueError("Telegram media download returned no file")
                     paths.append(path)
-                text = '\n\n'.join(row['text'] for row in members if row['text'])
+                text = '' if reply_to else '\n\n'.join(row['text'] for row in album if row['text'])
                 attachments = paths if len(paths) > 1 else paths[0] if paths else None
                 # Playwright operations must finish before shutdown closes the
                 # browser or removes an attached media file.
-                preparing = asyncio.create_task(self.publisher.prepare(text, attachments))
+                options = {'reply_to': reply_to} if reply_to else {}
+                preparing = asyncio.create_task(self.publisher.prepare(text, attachments, **options))
                 try:
                     await asyncio.shield(preparing)
                 except asyncio.CancelledError:
@@ -261,6 +281,13 @@ async def main(store, non_interactive=False):
                 await publisher.close()
 
 
+def current_settings():
+    try:
+        return BrowserSettings.from_config(read_config())
+    except Exception:
+        return None
+
+
 def delivery_key(value):
     try:
         channel, message = map(int, value.split(":"))
@@ -287,6 +314,8 @@ def cli():
     configure_logging(log_file=None if management else str(state / "forwarder.log"))
     try:
         if args.status:
+            for line in storage_report(BASE_DIR, current_settings()):
+                log.info("Storage: %s", line)
             if not (state / "deliveries.sqlite3").exists():
                 log.info("No saved deliveries yet. Start the forwarder to initialize its history cursor.")
                 return 0
@@ -312,12 +341,22 @@ def cli():
                     job = store.get(*args.mark_sent)
                     if job is None or job["state"] != "uncertain":
                         raise ValueError("--mark-sent requires an uncertain delivery")
-                    if any(row['state'] != 'uncertain' for row in store.members(job)):
-                        raise ValueError('All album members must be uncertain before --mark-sent')
-                    store.update(job, "sent", tweet_id=args.tweet_id)
+                    if any(row['state'] != 'uncertain' for row in store.batch(job)):
+                        raise ValueError('All batch members must be uncertain before --mark-sent')
+                    store.update(store.batch_job(job), "sent", tweet_id=args.tweet_id)
                     log.info("Delivery recorded as sent: %s:%s", *args.mark_sent)
                 else:
-                    asyncio.run(main(store, args.non_interactive))
+                    with runtime_lock():
+                        # Under both locks no post is being prepared, so any
+                        # media folder found now was left by a forced stop.
+                        try:
+                            clean_stale_media(BASE_DIR)
+                            clean_stale_runtimes()
+                        except OSError as error:  # Housekeeping never blocks forwarding.
+                            log.warning("Skipped cleanup of leftover files (%s).", error)
+                        for line in storage_report(BASE_DIR, current_settings()):
+                            log.info("Storage: %s", line)
+                        asyncio.run(main(store, args.non_interactive))
             finally:
                 store.close()
         return 0
