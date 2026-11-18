@@ -226,6 +226,91 @@ class LocalStorageTests(unittest.TestCase):
         for folder in (current, alive, foreign, garbled):
             self.assertTrue(folder.exists(), folder)
 
+    def use_real_appdata_layout(self):
+        """Point %LOCALAPPDATA% at a temp folder and drop the test override."""
+        appdata = Path(self.local.name) / "AppData" / "Local"
+        appdata.mkdir(parents=True)
+        env = patch.dict(os.environ, {"LOCALAPPDATA": str(appdata)})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("MEMEBOT_LOCAL_DIR")
+        redirect = patch("local_storage.appdata_redirected", return_value=False)
+        redirect.start()
+        self.addCleanup(redirect.stop)
+        return appdata
+
+    def sandboxed_copy(self, appdata, package, cookie=b"cookie", mtime=None):
+        folder = appdata / "Packages" / package / "LocalCache" / "Local" / "MemeBot"
+        profile = build_profile(folder / "x-browser-manual-msedge")
+        (profile / "Default" / "Network" / "Cookies").write_bytes(cookie)
+        if mtime:
+            os.utime(profile / "Default" / "Network" / "Cookies", (mtime, mtime))
+        (folder / "runtime.lock").write_text("0")
+        (folder / "x-browser-endpoint-msedge.json").write_text("{}")
+        (folder / "tmp").mkdir()
+        return folder
+
+    def test_login_captured_by_a_packaged_app_is_recovered_automatically(self):
+        appdata = self.use_real_appdata_layout()
+        folder = self.sandboxed_copy(appdata, "Claude_test")
+        migrate_legacy_storage(self.program.name, prune=prune_profile)
+        target = appdata / "MemeBot" / "x-browser-manual-msedge"
+        self.assertEqual((target / "Default" / "Network" / "Cookies").read_bytes(), b"cookie")
+        self.assertTrue((target / "Local State").exists())
+        # The sandboxed copy and MemeBot's own small leftovers there are gone.
+        self.assertFalse(folder.exists())
+        self.assertTrue((appdata / "Packages" / "Claude_test" / "LocalCache" / "Local").exists())
+
+    def test_newest_captured_login_wins_and_others_are_left_alone(self):
+        appdata = self.use_real_appdata_layout()
+        old = self.sandboxed_copy(appdata, "Old_app", cookie=b"old", mtime=1_000_000)
+        new = self.sandboxed_copy(appdata, "New_app", cookie=b"new", mtime=2_000_000)
+        migrate_legacy_storage(self.program.name)
+        self.assertEqual((appdata / "MemeBot" / "x-browser-manual-msedge" / "Default" / "Network" / "Cookies")
+                         .read_bytes(), b"new")
+        self.assertFalse(new.exists())
+        self.assertTrue((old / "x-browser-manual-msedge" / "Default" / "Network" / "Cookies").exists())
+
+    def test_existing_login_on_this_computer_is_never_replaced(self):
+        appdata = self.use_real_appdata_layout()
+        folder = self.sandboxed_copy(appdata, "Claude_test", cookie=b"sandboxed")
+        build_profile(appdata / "MemeBot" / "x-browser-manual-msedge")
+        migrate_legacy_storage(self.program.name)
+        self.assertEqual((appdata / "MemeBot" / "x-browser-manual-msedge" / "Default" / "Network" / "Cookies")
+                         .read_bytes(), b"cookie")
+        self.assertTrue((folder / "x-browser-manual-msedge" / "Default" / "Network" / "Cookies").exists())
+
+    def test_sandbox_folder_with_unknown_files_is_kept(self):
+        appdata = self.use_real_appdata_layout()
+        folder = self.sandboxed_copy(appdata, "Claude_test")
+        (folder / "notes.txt").write_text("not MemeBot's")
+        migrate_legacy_storage(self.program.name)
+        self.assertTrue((folder / "notes.txt").exists())
+        self.assertFalse((folder / "x-browser-manual-msedge").exists())
+
+    def test_nothing_moves_while_started_inside_a_packaged_app(self):
+        legacy = build_profile(self.state / "x-browser-manual-msedge")
+        with patch("local_storage.appdata_redirected", return_value=True), \
+             self.assertLogs("local_storage", "WARNING") as logs:
+            migrate_legacy_storage(self.program.name, prune=prune_profile)
+        self.assertIn("sandbox", "\n".join(logs.output))
+        self.assertTrue((legacy / "Default" / "Service Worker").exists())
+        self.assertFalse(manual_profile("msedge").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_redirect_probe_detects_a_sandboxed_write(self):
+        appdata = Path(self.local.name) / "AppData" / "Local"
+        captured = appdata / "Packages" / "Some_app" / "LocalCache" / "Local"
+        captured.mkdir(parents=True)
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(appdata)}):
+            os.environ.pop("MEMEBOT_LOCAL_DIR")
+            self.assertFalse(local_storage.appdata_redirected())
+            name = f"memebot-redirect-probe-{os.getpid()}-123.tmp"
+            (captured / name).write_text("")  # As if Windows had redirected the probe.
+            with patch("local_storage.time.time_ns", return_value=123):
+                self.assertTrue(local_storage.appdata_redirected())
+        self.assertEqual([path.name for path in appdata.iterdir()], ["Packages"])  # Probe removed.
+
     def test_process_check_recognises_this_process(self):
         self.assertTrue(local_storage.process_alive(os.getpid()))
         self.assertFalse(local_storage.process_alive(0))

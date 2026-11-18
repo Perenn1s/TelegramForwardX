@@ -163,52 +163,153 @@ def legacy_profiles(base_dir):
     return pairs + [(state / "x-browser", managed_profile())]
 
 
+def local_appdata():
+    return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+
+
+def appdata_redirected():
+    """True when Windows silently redirects this process's %LOCALAPPDATA% writes.
+
+    That happens when MemeBot is started from inside a packaged (MSIX) app,
+    such as an app's built-in terminal: files land in that app's private
+    Packages/<app>/LocalCache folder, invisible to MemeBot started normally.
+    The process may not even report a package identity, so this checks the
+    behaviour directly with a uniquely named, immediately removed probe file.
+    A custom MEMEBOT_LOCAL_DIR is not under %LOCALAPPDATA% and is not probed.
+    """
+    if os.name != "nt" or os.environ.get(LOCAL_DIR_ENV):
+        return False
+    appdata = local_appdata()
+    probe = appdata / f"memebot-redirect-probe-{os.getpid()}-{time.time_ns()}.tmp"
+    try:
+        probe.write_text("", encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        packages = [entry for entry in (appdata / "Packages").iterdir() if entry.is_dir()]
+    except OSError:
+        packages = []
+    try:
+        return any((package / "LocalCache" / "Local" / probe.name).exists() for package in packages)
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+def move_profile(source, target, source_root, prune=None, *, reason):
+    """Copy -> verify every file and size -> switch -> mark -> delete source.
+
+    Any doubt leaves the source untouched; an existing target is never
+    overwritten or merged. Returns True once the target holds the profile.
+    """
+    if is_link(source) or not source.is_dir():
+        log.warning("Not moving %s: it is not a plain folder.", source)
+        return False
+    if (source / MIGRATED_MARKER).is_file() and target.is_dir():
+        # A previous move completed but could not delete every old file.
+        freed = remove_tree(source, source_root)
+        log.info("Removed %.0f MB left from the earlier move of %s.", freed / 1024 ** 2, source)
+        return True
+    if target.exists():
+        log.warning("Kept %s: %s already exists on this computer, so the old copy was not merged or deleted. "
+                    "Delete the old folder by hand once you no longer need it.", source, target)
+        return False
+    if profile_in_use(source):
+        log.warning("Not moving %s yet: a browser is still using it. Close that window; it moves on the next start.",
+                    source)
+        return False
+    if prune is not None:
+        prune(source)  # Allow-listed caches only; shrinks the copy.
+    staging = target.with_name(f"{target.name}.moving-{os.getpid()}")
+    remove_tree(staging, local_root())
+    try:
+        shutil.copytree(source, staging, symlinks=True)
+        if file_manifest(staging) != file_manifest(source):
+            raise OSError("copied files differ from the original")
+        os.replace(staging, target)
+    except OSError as error:
+        remove_tree(staging, local_root())
+        log.warning("Could not move %s to %s (%s); the old copy is kept. Retrying on next start.",
+                    source, target, error)
+        return False
+    (source / MIGRATED_MARKER).write_text(f"Moved to {target} at {time.strftime('%Y-%m-%d %H:%M:%S')}.\n",
+                                          encoding="utf-8")
+    freed = remove_tree(source, source_root)
+    log.info("Moved %s to %s (%s); freed %.0f MB there. The X login is kept.",
+             source, target, reason, freed / 1024 ** 2)
+    return True
+
+
+def packaged_app_copies(name):
+    """MemeBot profiles that a packaged app's private storage captured."""
+    try:
+        found = list((local_appdata() / "Packages").glob(f"*/LocalCache/Local/MemeBot/{name}"))
+    except OSError:
+        return []
+    return [path for path in found if path.is_dir() and not is_link(path)
+            and (path / "Default" / "Network" / "Cookies").is_file()]
+
+
+def tidy_packaged_app_folder(folder):
+    """After adopting its profiles, drop MemeBot's own small leftovers there."""
+    for name in ["runtime.lock", *(f"x-browser-endpoint-{channel}.{ext}" for channel in CHANNELS
+                                   for ext in ("json", "tmp"))]:
+        remove_tree(folder / name, folder)
+    media = folder / "tmp"
+    if media.is_dir() and not is_link(media):
+        for entry in list(media.iterdir()):
+            if STALE_MEDIA.match(entry.name) and entry.is_dir() and not is_link(entry):
+                remove_tree(entry, media)
+        with_suppressed_rmdir(media)
+    with_suppressed_rmdir(folder)  # Only succeeds when nothing else is left.
+
+
+def with_suppressed_rmdir(folder):
+    try:
+        folder.rmdir()
+    except OSError:
+        pass
+
+
+def adopt_packaged_app_profiles(prune=None):
+    """Recover a browser login that a packaged app's sandbox captured.
+
+    If MemeBot once ran from inside a packaged app, its profile landed in
+    that app's private copy of %LOCALAPPDATA%. Started normally, MemeBot
+    moves the newest such login here when this computer has none yet.
+    """
+    if os.name != "nt" or os.environ.get(LOCAL_DIR_ENV):
+        return
+    for name in [f"x-browser-manual-{channel}" for channel in CHANNELS] + ["x-browser"]:
+        target = local_root() / name
+        if target.exists():
+            continue
+        copies = packaged_app_copies(name)
+        if not copies:
+            continue
+        source = max(copies, key=lambda path: (path / "Default" / "Network" / "Cookies").stat().st_mtime)
+        if move_profile(source, target, source.parent, prune, reason="recovered from a packaged app's private storage"):
+            tidy_packaged_app_folder(source.parent)
+
+
 def migrate_legacy_storage(base_dir, prune=None):
     """Move browser data out of the program folder, once, without loss.
 
-    Copy -> verify every file and size -> switch -> mark -> delete the old
-    copy. Any doubt leaves the old copy where it is; nothing is overwritten.
-    Call only while holding the program's instance lock.
+    Call only while holding the program's instance lock. Inside a packaged
+    app nothing is moved: it would land in that app's private storage.
     """
+    if appdata_redirected():
+        log.warning("MemeBot was started from inside another app's sandbox (for example an app's built-in terminal). "
+                    "Windows keeps its %%LOCALAPPDATA%% private to that app, so no browser data is moved now. "
+                    "Start MemeBot.exe or telegram.bat directly.")
+        return
     state = Path(base_dir) / "state"
     for legacy, target in legacy_profiles(base_dir):
-        if not legacy.exists():
-            continue
-        if is_link(legacy) or not legacy.is_dir():
-            log.warning("Not moving %s: it is not a plain folder.", legacy)
-            continue
-        if (legacy / MIGRATED_MARKER).is_file() and target.is_dir():
-            # A previous move completed but could not delete every old file.
-            freed = remove_tree(legacy, state)
-            log.info("Removed %.0f MB left from the earlier move of %s.", freed / 1024 ** 2, legacy.name)
-            continue
-        if target.exists():
-            log.warning("Kept %s: %s already exists on this computer, so the old copy was not merged or deleted. "
-                        "Delete the old folder by hand once you no longer need it.", legacy, target)
-            continue
-        if profile_in_use(legacy):
-            log.warning("Not moving %s yet: a browser is still using it. Close that window; it moves on the next start.",
-                        legacy.name)
-            continue
-        if prune is not None:
-            prune(legacy)  # Allow-listed caches only; shrinks the copy.
-        staging = target.with_name(f"{target.name}.moving-{os.getpid()}")
-        remove_tree(staging, local_root())
-        try:
-            shutil.copytree(legacy, staging, symlinks=True)
-            if file_manifest(staging) != file_manifest(legacy):
-                raise OSError("copied files differ from the original")
-            os.replace(staging, target)
-        except OSError as error:
-            remove_tree(staging, local_root())
-            log.warning("Could not move %s to %s (%s); the old copy is kept and used nowhere. Retrying on next start.",
-                        legacy, target, error)
-            continue
-        (legacy / MIGRATED_MARKER).write_text(f"Moved to {target} at {time.strftime('%Y-%m-%d %H:%M:%S')}.\n",
-                                              encoding="utf-8")
-        freed = remove_tree(legacy, state)
-        log.info("Moved %s to %s; freed %.0f MB in the program folder. The X login is kept.",
-                 legacy.name, target, freed / 1024 ** 2)
+        if legacy.exists():
+            move_profile(legacy, target, state, prune, reason="out of the program folder")
+    adopt_packaged_app_profiles(prune)
     for channel in CHANNELS:
         # Derived pointer, rewritten at every launch; the new location is local.
         for name in (f"x-browser-endpoint-{channel}.json", f"x-browser-endpoint-{channel}.tmp"):
