@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from local_storage import (check_profile_size, endpoint_file, managed_profile, manual_profile,
+from local_storage import (PROFILE_BUDGET_BYTES, check_profile_size, endpoint_file, managed_profile, manual_profile,
                            migrate_legacy_storage, path_size, profile_in_use, remove_tree)
 
 # Downloaded models, telemetry, crash dumps and component payloads. Edge
@@ -42,20 +42,27 @@ COMPONENT_DATA = (
 # Cookies live in "Network", the signed-in session in "Local Storage", "Session
 # Storage" and "IndexedDB"; none of those names may ever appear here.
 PAGE_CACHES = (
-    "Cache", "Code Cache", "Service Worker", "GPUCache", "DawnGraphiteCache",
+    "Cache", "GPUCache", "DawnGraphiteCache",
     "DawnWebGPUCache", "GrShaderCache", "ShaderCache", "Shared Dictionary",
     "AutofillAiModelCache", "EdgeCoupons", "EntityExtraction", "blob_storage",
     "optimization_guide_hint_cache_store",
 )
 
 
-def prune_profile(profile):
-    """Reclaim all rebuildable browser data, never login or site storage.
+# X's installed offline app: its service worker (~150 MB) and compiled scripts.
+# Rebuilding them after every launch made X load so slowly for a minute or two
+# that the composer timed out, so they are kept between launches and cleared
+# only when the profile grows beyond the budget (or on an explicit full prune).
+OFFLINE_APP = ("Service Worker", "Code Cache")
+
+
+def prune_profile(profile, *, everything=False):
+    """Reclaim rebuildable browser data, never login or site storage.
 
     Call this only while the dedicated browser is closed. Component payloads
-    and every page cache go each time, so the closed profile keeps only the
-    X session and a few small bookkeeping files. Only allow-listed names are
-    removed, only inside this profile, and links are never followed.
+    and page caches go each time; X's offline app is kept unless the profile
+    exceeds PROFILE_BUDGET_BYTES or everything=True. Only allow-listed names
+    are removed, only inside this profile, and links are never followed.
     """
     profile = Path(profile)
     if not profile.is_dir():
@@ -64,14 +71,20 @@ def prune_profile(profile):
         raise ValueError("The dedicated browser profile is still open. Close that browser window first; "
                          "nothing was deleted.")
     freed = sum(remove_tree(profile / name, profile) for name in COMPONENT_DATA)
-    freed += sum(remove_tree(child / name, profile)
-                 for child in profile.iterdir() if child.is_dir() and not child.is_symlink()
-                 for name in PAGE_CACHES)
+    browser_profiles = [child for child in profile.iterdir() if child.is_dir() and not child.is_symlink()]
+    freed += sum(remove_tree(child / name, profile) for child in browser_profiles for name in PAGE_CACHES)
+    if everything or path_size(profile) > PROFILE_BUDGET_BYTES:
+        freed += sum(remove_tree(child / name, profile) for child in browser_profiles for name in OFFLINE_APP)
     return freed
 
 
-def reclaim_profile_space(profile):
-    freed = prune_profile(profile)
+def prune_everything(profile):
+    """Smallest possible profile: before moving it, or on --prune-browser."""
+    return prune_profile(profile, everything=True)
+
+
+def reclaim_profile_space(profile, *, everything=False):
+    freed = prune_profile(profile, everything=everything)
     if freed:
         logging.info("Reclaimed %.0f MB of rebuildable browser data from %s. "
                      "The saved X login, cookies and site storage are untouched.",
@@ -88,12 +101,12 @@ def prune_browser(base_dir, settings):
     """--prune-browser: reclaim now instead of at the next browser launch."""
     if port_in_use(settings.debug_port):
         raise ValueError("Close the dedicated MemeBot browser window before pruning its profile.")
-    migrate_legacy_storage(base_dir, prune=prune_profile)
+    migrate_legacy_storage(base_dir, prune=prune_everything)
     profile = profile_directory(settings)
     if not profile.is_dir():
         raise ValueError("No dedicated browser profile yet; nothing to prune.")
     logging.info("Pruning %s.", profile.name)
-    reclaim_profile_space(profile)
+    reclaim_profile_space(profile, everything=True)
     logging.info("Profile now uses %.0f MB; the X session was kept.", path_size(profile) / 1024 ** 2)
 
 
@@ -179,7 +192,7 @@ def open_browser(base_dir, settings):
         raise ValueError("Browser debug port is occupied by another session. Close it or change Browser.debug_port.")
     # The closed debug port shows our browser is not attached; prune_profile
     # also refuses a profile held by a browser started without that port.
-    migrate_legacy_storage(base_dir, prune=prune_profile)
+    migrate_legacy_storage(base_dir, prune=prune_everything)
     profile = manual_profile(settings.channel)
     profile.mkdir(parents=True, exist_ok=True)
     executable = browser_executable(settings.channel)

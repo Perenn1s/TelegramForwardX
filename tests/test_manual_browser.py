@@ -91,12 +91,32 @@ class ProfileSizeTests(unittest.TestCase):
                 (profile / name).mkdir()
                 (profile / name / "payload").write_bytes(b"x" * 1024)
             (profile / "BrowserMetrics-spare.pma").write_bytes(b"x" * 1024)
-            freed = prune_profile(profile)
+            freed = prune_profile(profile, everything=True)
             self.assertGreater(freed, 30 * 1024 * 1024)
             self.assertLess(path_size(profile), 1024 * 1024)
             for name in ("component_crx_cache", "WidevineCdm", "Snapshots", "BrowserMetrics-spare.pma",
                          "Default/Service Worker", "Default/Cache", "Default/Code Cache"):
                 self.assertFalse((profile / name).exists(), name)
+            self.assert_login_survives(profile)
+
+    def test_x_offline_app_is_kept_between_launches_within_budget(self):
+        # Rebuilding it after every launch left X too slow to open the composer.
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.build_profile(directory, cache_mb=30)
+            prune_profile(profile)
+            self.assertFalse((profile / "Default" / "Cache").exists())
+            self.assertFalse((profile / "component_crx_cache").exists())
+            self.assertTrue((profile / "Default" / "Service Worker" / "data").exists())
+            self.assertTrue((profile / "Default" / "Code Cache" / "data").exists())
+            self.assert_login_survives(profile)
+
+    def test_x_offline_app_is_cleared_once_profile_exceeds_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.build_profile(directory, cache_mb=30)
+            with patch("manual_browser.PROFILE_BUDGET_BYTES", 5 * 1024 * 1024):
+                prune_profile(profile)
+            self.assertFalse((profile / "Default" / "Service Worker").exists())
+            self.assertFalse((profile / "Default" / "Code Cache").exists())
             self.assert_login_survives(profile)
 
     def test_small_profile_is_still_left_without_page_caches(self):
@@ -138,7 +158,7 @@ class ProfileSizeTests(unittest.TestCase):
             order.attach_mock(prune, "prune")
             order.attach_mock(launch, "launch")
             open_browser(directory, BrowserSettings())
-            prune.assert_called_once_with(manual_profile("msedge"))
+            prune.assert_called_once_with(manual_profile("msedge"), everything=False)
             self.assertEqual([call[0] for call in order.mock_calls], ["prune", "launch"])
         with tempfile.TemporaryDirectory() as directory, \
              patch("manual_browser.port_in_use", return_value=True), \

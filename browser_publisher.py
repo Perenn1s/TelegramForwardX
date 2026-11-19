@@ -11,7 +11,7 @@ import re
 from urllib.parse import urlsplit
 
 from playwright.async_api import async_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, expect
-from manual_browser import (ZERO_CACHE_ARGS, profile_directory, prune_profile, reclaim_profile_space,
+from manual_browser import (ZERO_CACHE_ARGS, profile_directory, prune_everything, reclaim_profile_space,
                             saved_endpoint, open_browser)
 from local_storage import migrate_legacy_storage
 
@@ -52,7 +52,11 @@ class PostLimitReached(BrowserAttention):
 
 
 class ComposerNotReady(BrowserAttention):
-    """The empty composer did not load in time; nothing was typed or clicked."""
+    """X was not ready in time before any publish click; nothing was posted.
+
+    Any text or media typed so far was discarded with its tab, so the
+    delivery can safely be composed again later.
+    """
 
 
 class BrowserUnavailable(BrowserAttention):
@@ -140,7 +144,7 @@ class BrowserPublisher:
         # The managed profile is launched below, so it is closed right now;
         # pruning still refuses it if another browser holds it.
         try:
-            await asyncio.to_thread(migrate_legacy_storage, self.state_dir.parent, prune_profile)
+            await asyncio.to_thread(migrate_legacy_storage, self.state_dir.parent, prune_everything)
             await asyncio.to_thread(reclaim_profile_space, self.profile_dir)
         except ValueError as error:
             raise BrowserAttention(str(error)) from error
@@ -347,6 +351,14 @@ class BrowserPublisher:
         except (PlaywrightError, AssertionError) as error:
             if self.is_disconnected():
                 raise BrowserUnavailable(f'Browser/tab closed during {stage}; no publish click was made.') from error
+            if isinstance(error, (PlaywrightTimeoutError, AssertionError)):
+                # Slow loading/upload or a passing overlay, before any click:
+                # discard our own unsent draft and let the queue retry later.
+                with suppress(PlaywrightError):
+                    await self.page.remove_locator_handler(save_dialog)
+                await self.drop_unsent_page()
+                raise ComposerNotReady(f"X composer/upload did not become ready ({stage}; {type(error).__name__}). "
+                                       "The unsent draft was discarded; no publish click was made.") from error
             raise BrowserAttention(f"X composer/upload did not become ready ({stage}; {type(error).__name__}). Check the browser for login, "
                                    "media errors or a changed layout; no publish click was made.") from error
         finally:

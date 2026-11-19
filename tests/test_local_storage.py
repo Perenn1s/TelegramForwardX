@@ -11,7 +11,7 @@ import local_storage
 from local_storage import (MIGRATED_MARKER, RUNTIME_MARKER, check_profile_size, clean_stale_media,
                            clean_stale_runtimes, endpoint_file, local_root, manual_profile, managed_profile,
                            media_temp_dir, migrate_legacy_storage, profile_in_use, remove_tree, storage_report)
-from manual_browser import open_browser, prune_profile
+from manual_browser import open_browser, prune_everything, prune_profile
 from browser_publisher import BrowserSettings
 
 
@@ -61,7 +61,7 @@ class LocalStorageTests(unittest.TestCase):
         legacy = build_profile(self.state / "x-browser-manual-msedge", cache_mb=2)
         before = login_files(legacy)
         (self.state / "x-browser-endpoint-msedge.json").write_text("{}")
-        migrate_legacy_storage(self.program.name, prune=prune_profile)
+        migrate_legacy_storage(self.program.name, prune=prune_everything)
         target = manual_profile("msedge")
         self.assertFalse(legacy.exists())
         self.assertFalse((self.state / "x-browser-endpoint-msedge.json").exists())
@@ -74,7 +74,7 @@ class LocalStorageTests(unittest.TestCase):
         legacy = build_profile(self.state / "x-browser-manual-msedge")
         target = build_profile(manual_profile("msedge"))
         (target / "Default" / "Network" / "Cookies").write_bytes(b"newer login")
-        migrate_legacy_storage(self.program.name, prune=prune_profile)
+        migrate_legacy_storage(self.program.name, prune=prune_everything)
         self.assertTrue(legacy.exists())
         self.assertEqual((target / "Default" / "Network" / "Cookies").read_bytes(), b"newer login")
         self.assertEqual((legacy / "Default" / "Network" / "Cookies").read_bytes(), b"cookie")
@@ -83,7 +83,7 @@ class LocalStorageTests(unittest.TestCase):
         legacy = build_profile(self.state / "x-browser-manual-msedge")
         with patch("local_storage.profile_in_use", return_value=True), \
              patch("manual_browser.profile_in_use", return_value=True):
-            migrate_legacy_storage(self.program.name, prune=prune_profile)
+            migrate_legacy_storage(self.program.name, prune=prune_everything)
             with self.assertRaisesRegex(ValueError, "still open"):
                 prune_profile(legacy)
         self.assertTrue((legacy / "Default" / "Service Worker").exists())
@@ -102,7 +102,7 @@ class LocalStorageTests(unittest.TestCase):
             return manifest
 
         with patch("local_storage.file_manifest", side_effect=lossy_manifest):
-            migrate_legacy_storage(self.program.name, prune=prune_profile)
+            migrate_legacy_storage(self.program.name, prune=prune_everything)
         self.assertEqual(login_files(legacy), before)
         self.assertFalse(manual_profile("msedge").exists())
         self.assertEqual([path for path in local_root().iterdir() if "moving" in path.name], [])
@@ -145,7 +145,7 @@ class LocalStorageTests(unittest.TestCase):
         (precious / "file").write_text("keep")
         link = self.state / "x-browser-manual-msedge"
         _winapi.CreateJunction(str(precious), str(link))
-        migrate_legacy_storage(self.program.name, prune=prune_profile)
+        migrate_legacy_storage(self.program.name, prune=prune_everything)
         self.assertEqual(remove_tree(link, self.state), 0)
         self.assertTrue((precious / "file").exists())
         # A junction placed inside a profile cache is not followed either.
@@ -253,7 +253,7 @@ class LocalStorageTests(unittest.TestCase):
     def test_login_captured_by_a_packaged_app_is_recovered_automatically(self):
         appdata = self.use_real_appdata_layout()
         folder = self.sandboxed_copy(appdata, "Claude_test")
-        migrate_legacy_storage(self.program.name, prune=prune_profile)
+        migrate_legacy_storage(self.program.name, prune=prune_everything)
         target = appdata / "MemeBot" / "x-browser-manual-msedge"
         self.assertEqual((target / "Default" / "Network" / "Cookies").read_bytes(), b"cookie")
         self.assertTrue((target / "Local State").exists())
@@ -292,7 +292,7 @@ class LocalStorageTests(unittest.TestCase):
         legacy = build_profile(self.state / "x-browser-manual-msedge")
         with patch("local_storage.appdata_redirected", return_value=True), \
              self.assertLogs("local_storage", "WARNING") as logs:
-            migrate_legacy_storage(self.program.name, prune=prune_profile)
+            migrate_legacy_storage(self.program.name, prune=prune_everything)
         self.assertIn("sandbox", "\n".join(logs.output))
         self.assertTrue((legacy / "Default" / "Service Worker").exists())
         self.assertFalse(manual_profile("msedge").exists())

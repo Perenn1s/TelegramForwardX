@@ -44,6 +44,7 @@ document.querySelector('input').onchange=()=>{
 };
 document.querySelector('button').onclick=()=>{
   window.clicks++;
+  if (window.recordPublishClick) window.recordPublishClick();
   const toast=document.querySelector('[data-testid="toast"]');
   toast.innerHTML='<a href="/example_user/status/123">View</a>';
 };
@@ -81,7 +82,15 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         self.page = await (await self.browser.new_context()).new_page()
         self.page.set_default_timeout(1000)
         self.html = FIXTURE
-        await self.page.route("**/*", lambda route: route.fulfill(status=200, content_type="text/html", body=self.html))
+        # Context-wide, so a replacement tab never reaches the real x.com and
+        # publish clicks are still counted after a tab with a draft is closed.
+        await self.page.context.route("**/*", lambda route: route.fulfill(status=200, content_type="text/html", body=self.html))
+        self.publish_clicks = 0
+
+        def record_publish_click():
+            self.publish_clicks += 1
+
+        await self.page.context.expose_function("recordPublishClick", record_publish_click)
         self.publisher = BrowserPublisher(self.directory.name, BrowserSettings(
             expected_username="example_user", timeout_seconds=1, upload_timeout_seconds=1))
         self.publisher.page = self.page
@@ -90,23 +99,29 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         await self.browser.close()
         await self.runtime.stop()
 
+    async def clicks(self):
+        """Publish clicks on the test tab, even if a failed draft's tab was closed."""
+        if self.page.is_closed():
+            return self.publish_clicks
+        return await self.page.evaluate("window.clicks")
+
     async def test_unicode_text_and_local_media_publish_once(self):
         path = Path(self.directory.name) / "test.jpg"
         path.write_bytes(b"local fixture")
         await self.publisher.prepare("中文 🐈\nsecond line", path)
         self.assertEqual(await self.page.locator('input').evaluate("input => input.files[0].name"), "test.jpg")
-        self.assertEqual(await self.page.evaluate("window.clicks"), 0)
+        self.assertEqual(await self.clicks(), 0)
         self.assertEqual(await self.publisher.submit(), "123")
-        self.assertEqual(await self.page.evaluate("window.clicks"), 1)
+        self.assertEqual(await self.clicks(), 1)
         with self.assertRaises(BrowserAttention):
             await self.publisher.submit()
-        self.assertEqual(await self.page.evaluate("window.clicks"), 1)
+        self.assertEqual(await self.clicks(), 1)
 
     async def test_existing_draft_is_not_overwritten(self):
         self.html = FIXTURE.replace('data-testid="tweetTextarea_0"></div>', 'data-testid="tweetTextarea_0">existing draft</div>')
         with self.assertRaisesRegex(BrowserAttention, "existing draft"):
             await self.publisher.prepare("new message")
-        self.assertEqual(await self.page.evaluate("window.clicks"), 0)
+        self.assertEqual(await self.clicks(), 0)
 
     async def test_reply_opens_saved_parent_instead_of_another_post(self):
         self.publisher.username = 'example_user'
@@ -125,7 +140,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         self.publisher.username = 'example_user'
         with self.assertRaises(BrowserAttention):
             await self.publisher.prepare('reply', reply_to='900')
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
 
     async def test_media_only_post_with_empty_editor_placeholder(self):
         self.html = FIXTURE.replace('data-testid="tweetTextarea_0"></div>',
@@ -135,9 +150,9 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         await self.publisher.prepare('', path)
         self.assertEqual(await self.page.locator('[contenteditable]').inner_text(), '\n')
         self.assertTrue(self.publisher.prepared)
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
         self.assertEqual(await self.publisher.submit(), '123')
-        self.assertEqual(await self.page.evaluate('window.clicks'), 1)
+        self.assertEqual(await self.clicks(), 1)
 
     async def test_visible_composer_without_aria_modal_is_used(self):
         self.html = FIXTURE.replace(' aria-modal="true"', '')
@@ -145,7 +160,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         path.write_bytes(b'local fixture')
         await self.publisher.prepare('', path)
         self.assertTrue(self.publisher.prepared)
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
         self.assertEqual(await self.publisher.submit(), '123')
 
     async def test_ready_composer_does_not_wait_for_unrelated_deferred_script(self):
@@ -159,7 +174,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(self.publisher.prepare('caption'), 3)
             self.assertEqual(await self.page.evaluate('document.readyState'), 'interactive')
             self.assertTrue(self.publisher.prepared)
-            self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+            self.assertEqual(await self.clicks(), 0)
         finally:
             release.set()
             await self.page.wait_for_load_state('domcontentloaded')
@@ -176,9 +191,9 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         await self.publisher.prepare('', path)
         self.assertEqual(len(navigations), 2)
         self.assertTrue(self.publisher.prepared)
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
         self.assertEqual(await self.publisher.submit(), '123')
-        self.assertEqual(await self.page.evaluate('window.clicks'), 1)
+        self.assertEqual(await self.clicks(), 1)
 
     async def test_persistent_missing_composer_stops_after_two_attempts(self):
         self.html = FIXTURE.replace('tweetTextarea_0', 'not-ready')
@@ -187,7 +202,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
                 await self.publisher.prepare('caption')
             self.assertEqual(navigate.call_count, 2)
         self.assertFalse(self.publisher.prepared)
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
 
     async def test_draft_entered_during_startup_timeout_prevents_reload(self):
         self.html = FIXTURE.replace('role="dialog"', 'role="region"').replace('</script>', '''
@@ -198,7 +213,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
                 await self.publisher.prepare('queued caption')
             self.assertEqual(navigate.call_count, 1)
         self.assertEqual(await self.page.locator('[contenteditable]').inner_text(), 'manual draft')
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
 
     async def test_unexpected_text_after_media_upload_blocks_publish(self):
         self.html = FIXTURE.replace("document.querySelector('[role=dialog]').append(attachments);", """
@@ -210,7 +225,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(BrowserAttention, 'verifying final post content; expected 0 characters'):
             await self.publisher.prepare('', path)
         self.assertFalse(self.publisher.prepared)
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
 
     async def test_reused_tab_draft_is_preserved_before_navigation(self):
         await self.page.goto('https://x.com/home')
@@ -219,7 +234,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
             await self.publisher.prepare('queued message')
         self.assertEqual(self.page.url, 'https://x.com/home')
         self.assertEqual(await self.page.locator('[contenteditable]').inner_text(), 'my unsent draft')
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
 
     async def test_two_images_attached_to_one_post_in_order(self):
         paths = [Path(self.directory.name) / name for name in ('first.jpg', 'second.jpg')]
@@ -229,7 +244,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.locator('input').evaluate('e => [...e.files].map(f=>f.name)'),
                          ['first.jpg', 'second.jpg'])
         self.assertEqual(await self.publisher.submit(), '123')
-        self.assertEqual(await self.page.evaluate('window.clicks'), 1)
+        self.assertEqual(await self.clicks(), 1)
 
     async def test_oversized_album_is_rejected_before_navigation(self):
         with self.assertRaisesRegex(BrowserAttention, 'at most 4'):
@@ -245,7 +260,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(BrowserAttention, 'did not become ready'):
             await self.publisher.prepare('album', paths)
         self.assertFalse(self.publisher.prepared)
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
 
     async def test_background_composer_is_never_used(self):
         self.html = FIXTURE.replace('</body>', '''
@@ -281,7 +296,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(BrowserAttention, "did not become ready"):
             await self.publisher.prepare("video", path)
         self.assertFalse(self.publisher.prepared)
-        self.assertEqual(await self.page.evaluate("window.clicks"), 0)
+        self.assertEqual(await self.clicks(), 0)
 
     async def test_wrong_logged_in_account_blocks_before_typing(self):
         self.html = FIXTURE.replace('href="/example_user"', 'href="/other"')
@@ -304,14 +319,14 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         try:
             await asyncio.sleep(0.1)
             self.assertFalse(task.done())
-            self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+            self.assertEqual(await self.clicks(), 0)
             # Simulate the account link appearing after the user signs in.
             await self.page.locator('[data-testid="AppTabBar_Profile_Link"]').evaluate('e => e.hidden=false')
             await asyncio.wait_for(task, 3)
             self.assertEqual(self.publisher.username, 'example_user')
             self.assertTrue(self.publisher.account_file.exists())
             self.assertFalse(self.publisher.keep_page)
-            self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+            self.assertEqual(await self.clicks(), 0)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -319,10 +334,10 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
     async def test_no_toast_permalink_never_uses_timeline_post(self):
         await self.publisher.prepare("hello")
         await self.page.evaluate("() => { document.querySelector('button').onclick=()=>{window.clicks++}; }")
-        self.assertEqual(await self.page.evaluate("window.clicks"), 0)
+        self.assertEqual(await self.clicks(), 0)
         with self.assertRaisesRegex(BrowserAttention, "no new post permalink"):
             await self.publisher.submit()
-        self.assertEqual(await self.page.evaluate("window.clicks"), 1)
+        self.assertEqual(await self.clicks(), 1)
 
     async def test_old_toast_cannot_confirm_new_post(self):
         self.html = FIXTURE.replace('<div data-testid="toast"></div>', '<div data-testid="toast"><a href="/example_user/status/123">View</a></div>')
@@ -334,7 +349,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         self.html = FIXTURE.replace('<button data-testid=', '<button disabled data-testid=')
         with self.assertRaisesRegex(BrowserAttention, "did not become ready"):
             await self.publisher.prepare("hello")
-        self.assertEqual(await self.page.evaluate("window.clicks"), 0)
+        self.assertEqual(await self.clicks(), 0)
 
     async def test_hashtag_autocomplete_is_dismissed_without_changing_caption(self):
         self.html = FIXTURE.replace('</script>', '''
@@ -353,7 +368,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.locator('[contenteditable]').inner_text(), 'cat #猫猫')
         self.assertEqual(await self.page.locator('[role="listbox"]').count(), 0)
         self.assertFalse(await self.page.evaluate('!!window.composerClosed'))
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
         self.assertEqual(await self.publisher.submit(), '123')
 
     async def test_late_hashtag_autocomplete_is_dismissed_before_post_check(self):
@@ -381,7 +396,7 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.locator('[role="listbox"]').count(), 0)
         self.assertEqual(await self.page.locator('[contenteditable]').inner_text(), '喵：找我呢？\n#猫猫')
         self.assertTrue(self.publisher.prepared)
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
         self.assertEqual(await self.publisher.submit(), '123')
 
     async def test_daily_limit_after_click_is_unpublished_and_tab_replaced(self):
@@ -390,8 +405,6 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
           const banner=document.createElement('div');
           banner.textContent="You’ve hit the daily post limit. Subscribe to Plus for higher limits.";
           document.querySelector('[role=dialog]').prepend(banner);''')
-        await self.page.context.route('**/*', lambda route: route.fulfill(
-            status=200, content_type='text/html', body='<html><body>home</body></html>'))
         old = self.page
         await self.publisher.prepare('caption')
         with self.assertRaises(PostLimitReached):
@@ -419,14 +432,14 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
             await self.publisher.prepare('caption')
         self.assertEqual(await self.page.locator('[contenteditable]').inner_text(), '')
         self.assertFalse(self.publisher.prepared)
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
 
     async def test_unknown_overlay_blocks_before_prepared_and_never_clicks(self):
         self.html = FIXTURE.replace('</body>', '<div style="position:fixed;inset:0;z-index:9999"></div></body>')
         with self.assertRaisesRegex(BrowserAttention, 'unobstructed'):
             await self.publisher.prepare('caption')
         self.assertFalse(self.publisher.prepared)
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        self.assertEqual(await self.clicks(), 0)
 
     async def test_save_prompt_returns_to_composer_without_saving_or_discarding_post(self):
         self.html = FIXTURE.replace('</script>', '''
@@ -470,18 +483,21 @@ class BrowserUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.locator('input').evaluate('e => e.files.length'), 1)
         self.assertTrue(self.publisher.prepared)
         self.assertEqual(await self.publisher.submit(), '123')
-        self.assertEqual(await self.page.evaluate('window.clicks'), 1)
+        self.assertEqual(await self.clicks(), 1)
 
     async def test_other_confirmation_is_not_automatically_cancelled(self):
         self.html = FIXTURE.replace('</body>', '''
           <div data-testid="confirmationSheetDialog" style="position:fixed;inset:0;z-index:9999">
             <h2>Delete post?</h2>
-            <button data-testid="confirmationSheetCancel" onclick="window.cancelled=true;this.parentNode.remove()">Cancel</button>
+            <button data-testid="confirmationSheetCancel" onclick="window.recordCancel();this.parentNode.remove()">Cancel</button>
           </div></body>''')
+        cancelled = []
+        await self.page.context.expose_function("recordCancel", lambda: cancelled.append(True))
         with self.assertRaises(BrowserAttention):
             await self.publisher.prepare('caption')
-        self.assertFalse(await self.page.evaluate('!!window.cancelled'))
-        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+        # The tab holding it may be closed for a later retry, but never by Cancel.
+        self.assertEqual(cancelled, [])
+        self.assertEqual(await self.clicks(), 0)
 
 
 @unittest.skipUnless(os.name == "nt" and os.environ.get("MEMEBOT_BROWSER_TESTS") == "1",

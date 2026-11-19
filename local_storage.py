@@ -33,10 +33,11 @@ MEDIA_PREFIX = "forward-"
 # tempfile.TemporaryDirectory names: prefix + 8 chars from [a-z0-9_].
 STALE_MEDIA = re.compile(rf"^{MEDIA_PREFIX}[a-z0-9_]{{8}}$")
 CHANNELS = ("msedge", "chrome")
-# Expected size of a pruned, closed profile is ~20 MB, and ~170 MB while X's
-# offline cache is loaded. More than this right after pruning means something
-# unknown is growing; it is reported, never deleted blindly.
-PROFILE_WARN_BYTES = 300 * 1024 ** 2
+# A closed profile holds the X login (~20 MB) plus X's offline app (~150 MB),
+# which is kept between launches. Above this budget the offline app is cleared
+# too; anything still above it is unknown growth, reported, never deleted blindly.
+PROFILE_BUDGET_BYTES = 400 * 1024 ** 2
+PROFILE_WARN_BYTES = PROFILE_BUDGET_BYTES
 
 log = logging.getLogger(__name__)
 

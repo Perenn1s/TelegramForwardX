@@ -121,7 +121,7 @@ class Forwarder:
             # or clicked, so retrying later cannot duplicate a post.
             delay = failure_delay(error, job['attempts'] + 1)
             self.store.update(job, 'pending', error=error, next_attempt=time.time() + delay)
-            log.warning('Delivery %s saved: X composer did not load in time; nothing was typed or posted. '
+            log.warning('Delivery %s saved: X was not ready before posting (nothing was posted). '
                         'Retrying in %ss.', key, delay)
             return
         if isinstance(error, BrowserAttention):
