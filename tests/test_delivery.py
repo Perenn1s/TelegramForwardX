@@ -19,7 +19,7 @@ import requests
 from delivery_store import DeliveryStore, instance_lock
 from forwarder import Forwarder, NeedsAttention, cli, main
 from run_background import supervise
-from browser_publisher import BrowserAttention, BrowserUnavailable, PostLimitReached
+from browser_publisher import BrowserAttention, BrowserUnavailable, ComposerNotReady, PostLimitReached
 
 
 def message(id=1, text="hello", media=False):
@@ -276,6 +276,22 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get(-1001, 1)["state"], "failed")
         self.assertEqual(self.store.next_job(-1001)["message_id"], 2)
         self.publisher.submit.assert_not_awaited()
+
+    async def test_slow_composer_retries_later_without_stopping(self):
+        # Live: right after launch X loaded too slowly twice; nothing was typed.
+        self.publisher.prepare.side_effect = ComposerNotReady("waiting for visible composer editor")
+        first = self.add_job()
+        self.add_job(2)
+        await self.service.process(first)
+        job = self.store.get(-1001, 1)
+        self.assertEqual(job["state"], "pending")
+        self.assertGreater(job["next_attempt"], time.time())
+        # Message order keeps the later delivery behind the delayed one.
+        self.assertEqual(self.store.next_job(-1001)["message_id"], 1)
+        self.publisher.submit.assert_not_awaited()
+        self.publisher.prepare.side_effect = None
+        await self.service.process(self.store.get(-1001, 1))
+        self.assertEqual(self.store.get(-1001, 1)["state"], "sent")
 
     async def test_media_download_failure_retries_without_posting(self):
         self.telegram.get_messages = AsyncMock(side_effect=OSError("offline"))

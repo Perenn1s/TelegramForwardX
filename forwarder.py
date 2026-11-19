@@ -20,7 +20,7 @@ from local_storage import (MEDIA_PREFIX, clean_stale_media, clean_stale_runtimes
                            runtime_lock, storage_report)
 from load_Api_x import BASE_DIR, create_telegram, read_config
 from browser_publisher import (BrowserPublisher, BrowserSettings, BrowserAttention, BrowserUnavailable,
-                               PostLimitReached)
+                               ComposerNotReady, PostLimitReached)
 from proxy_settings import resolve_proxy
 from runtime_logging import configure_logging
 
@@ -115,6 +115,14 @@ class Forwarder:
             delay = failure_delay(error, job['attempts'] + 1)
             self.store.update(job, 'pending', error=error, next_attempt=time.time() + delay)
             log.warning('Delivery %s saved: browser disconnected before publishing. Reconnecting in %ss.', key, delay)
+            return
+        if isinstance(error, ComposerNotReady):
+            # X loaded too slowly (e.g. right after launch); nothing was typed
+            # or clicked, so retrying later cannot duplicate a post.
+            delay = failure_delay(error, job['attempts'] + 1)
+            self.store.update(job, 'pending', error=error, next_attempt=time.time() + delay)
+            log.warning('Delivery %s saved: X composer did not load in time; nothing was typed or posted. '
+                        'Retrying in %ss.', key, delay)
             return
         if isinstance(error, BrowserAttention):
             self.store.update(job, "failed", error=error)

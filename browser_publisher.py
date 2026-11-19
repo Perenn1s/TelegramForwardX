@@ -51,6 +51,10 @@ class PostLimitReached(BrowserAttention):
     """X refused the post at its daily limit; nothing was published."""
 
 
+class ComposerNotReady(BrowserAttention):
+    """The empty composer did not load in time; nothing was typed or clicked."""
+
+
 class BrowserUnavailable(BrowserAttention):
     """Browser/tab disconnected before any publish click; safe to retry."""
 
@@ -428,7 +432,7 @@ class BrowserPublisher:
                     log.warning('X composer startup timed out (%s); retrying the empty composer once. '
                                 'No text or media entered and no publish click made.', stage)
                     continue
-                raise BrowserAttention(
+                raise ComposerNotReady(
                     f'X composer did not become ready ({stage}; TimeoutError; 2 attempts). '
                     'No text or media entered and no publish click was made. Check the browser for login or a changed layout.'
                 ) from error
